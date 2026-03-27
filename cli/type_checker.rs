@@ -657,6 +657,10 @@ struct GraphWalker<'a> {
   has_seen_node_builtin: bool,
   roots: Vec<(ModuleSpecifier, MediaType)>,
   missing_diagnostics: tsc::Diagnostics,
+  /// Cache of parsed sources keyed by specifier, used to check whether a
+  /// resolution error is suppressed by a `@ts-ignore` / `@ts-expect-error`
+  /// comment without re-parsing the same source file more than once.
+  parsed_source_cache: HashMap<ModuleSpecifier, deno_ast::ParsedSource>,
 }
 
 impl<'a> GraphWalker<'a> {
@@ -697,6 +701,7 @@ impl<'a> GraphWalker<'a> {
       has_seen_node_builtin: false,
       roots: Vec::with_capacity(graph.imports.len() + graph.specifiers_count()),
       missing_diagnostics: Default::default(),
+      parsed_source_cache: HashMap::new(),
     }
   }
 
@@ -768,22 +773,27 @@ impl<'a> GraphWalker<'a> {
           {
             let suppressed = err.maybe_range.is_some_and(|range| {
               let import_line = range.range.start.line as u32;
-              if let Ok(Some(Module::Js(referrer_module))) =
-                self.graph.try_get(&range.specifier)
-              {
-                deno_ast::parse_module(deno_ast::ParseParams {
-                  specifier: referrer_module.specifier.clone(),
-                  text: referrer_module.source.text.clone(),
-                  media_type: referrer_module.media_type,
-                  capture_tokens: false,
-                  scope_analysis: false,
-                  maybe_syntax: None,
-                })
-                .ok()
-                .is_some_and(|ps| is_resolution_suppressed(&ps, import_line))
-              } else {
-                false
+              if let Some(ps) = self.parsed_source_cache.get(&range.specifier) {
+                return is_resolution_suppressed(ps, import_line);
               }
+              let Ok(Some(Module::Js(referrer_module))) =
+                self.graph.try_get(&range.specifier)
+              else {
+                return false;
+              };
+              let Ok(ps) = deno_ast::parse_module(deno_ast::ParseParams {
+                specifier: referrer_module.specifier.clone(),
+                text: referrer_module.source.text.clone(),
+                media_type: referrer_module.media_type,
+                capture_tokens: false,
+                scope_analysis: false,
+                maybe_syntax: None,
+              }) else {
+                return false;
+              };
+              let result = is_resolution_suppressed(&ps, import_line);
+              self.parsed_source_cache.insert(range.specifier.clone(), ps);
+              result
             });
             if !suppressed {
               self.missing_diagnostics.push(
@@ -810,20 +820,10 @@ impl<'a> GraphWalker<'a> {
 
       let mut maybe_module_dependencies = None;
       let mut maybe_types_dependency = None;
-      let mut maybe_parsed_source: Option<deno_ast::ParsedSource> = None;
       match module {
         Module::Js(module) => {
           maybe_module_dependencies =
             Some(module.dependencies_prefer_fast_check());
-          maybe_parsed_source = deno_ast::parse_module(deno_ast::ParseParams {
-            specifier: module.specifier.clone(),
-            text: module.source.text.clone(),
-            media_type: module.media_type,
-            capture_tokens: false,
-            scope_analysis: false,
-            maybe_syntax: None,
-          })
-          .ok();
           maybe_types_dependency = module
             .maybe_types_dependency
             .as_ref()
@@ -884,9 +884,27 @@ impl<'a> GraphWalker<'a> {
           {
             // pos.line is 0-indexed, matching Position::line
             let suppressed = diagnostic.start.as_ref().is_some_and(|pos| {
-              maybe_parsed_source
-                .as_ref()
-                .is_some_and(|ps| is_resolution_suppressed(ps, pos.line as u32))
+              let import_line = pos.line as u32;
+              let specifier = module.specifier();
+              if let Some(ps) = self.parsed_source_cache.get(specifier) {
+                return is_resolution_suppressed(ps, import_line);
+              }
+              let Module::Js(js_module) = module else {
+                return false;
+              };
+              let Ok(ps) = deno_ast::parse_module(deno_ast::ParseParams {
+                specifier: js_module.specifier.clone(),
+                text: js_module.source.text.clone(),
+                media_type: js_module.media_type,
+                capture_tokens: false,
+                scope_analysis: false,
+                maybe_syntax: None,
+              }) else {
+                return false;
+              };
+              let result = is_resolution_suppressed(&ps, import_line);
+              self.parsed_source_cache.insert(specifier.clone(), ps);
+              result
             });
             if !suppressed {
               self.missing_diagnostics.push(diagnostic);
@@ -1296,6 +1314,14 @@ mod test {
     // Wrong directive — not suppressed.
     assert!(!is_resolution_suppressed(
       &parse_test_source("// @ts-check\nimport { foo } from 'pkg'"),
+      1,
+    ));
+
+    // Inline comment on preceding statement — not suppressed.
+    assert!(!is_resolution_suppressed(
+      &parse_test_source(
+        "const x = 1; // @ts-ignore\nimport { foo } from 'pkg'"
+      ),
       1,
     ));
   }
