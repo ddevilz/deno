@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use deno_ast::MediaType;
 use deno_ast::ModuleSpecifier;
+use deno_ast::SourceRangedForSpanned;
 use deno_config::deno_json::CompilerOptionTypesDeserializeError;
 use deno_core::url::Url;
 use deno_error::JsErrorBox;
@@ -765,16 +766,37 @@ impl<'a> GraphWalker<'a> {
           if !is_dynamic
             && let Some(err) = module_error_for_tsc_diagnostic(self.sys, err)
           {
-            self
-              .missing_diagnostics
-              .push(tsc::Diagnostic::from_missing_error(
-                err.specifier.as_str(),
-                err.maybe_range,
-                maybe_additional_sloppy_imports_message(
-                  self.sys,
-                  err.specifier,
-                ),
-              ));
+            let suppressed = err.maybe_range.is_some_and(|range| {
+              let import_line = range.range.start.line as u32;
+              if let Ok(Some(Module::Js(referrer_module))) =
+                self.graph.try_get(&range.specifier)
+              {
+                deno_ast::parse_module(deno_ast::ParseParams {
+                  specifier: referrer_module.specifier.clone(),
+                  text: referrer_module.source.text.clone(),
+                  media_type: referrer_module.media_type,
+                  capture_tokens: false,
+                  scope_analysis: false,
+                  maybe_syntax: None,
+                })
+                .ok()
+                .is_some_and(|ps| is_resolution_suppressed(&ps, import_line))
+              } else {
+                false
+              }
+            });
+            if !suppressed {
+              self
+                .missing_diagnostics
+                .push(tsc::Diagnostic::from_missing_error(
+                  err.specifier.as_str(),
+                  err.maybe_range,
+                  maybe_additional_sloppy_imports_message(
+                    self.sys,
+                    err.specifier,
+                  ),
+                ));
+            }
           }
           continue;
         }
@@ -788,12 +810,20 @@ impl<'a> GraphWalker<'a> {
 
       let mut maybe_module_dependencies = None;
       let mut maybe_types_dependency = None;
-      let mut maybe_source_text: Option<&str> = None;
+      let mut maybe_parsed_source: Option<deno_ast::ParsedSource> = None;
       match module {
         Module::Js(module) => {
           maybe_module_dependencies =
             Some(module.dependencies_prefer_fast_check());
-          maybe_source_text = Some(&module.source.text);
+          maybe_parsed_source = deno_ast::parse_module(deno_ast::ParseParams {
+            specifier: module.specifier.clone(),
+            text: module.source.text.clone(),
+            media_type: module.media_type,
+            capture_tokens: false,
+            scope_analysis: false,
+            maybe_syntax: None,
+          })
+          .ok();
           maybe_types_dependency = module
             .maybe_types_dependency
             .as_ref()
@@ -852,9 +882,11 @@ impl<'a> GraphWalker<'a> {
             && let Some(diagnostic) =
               tsc::Diagnostic::maybe_from_resolution_error(resolution_error)
           {
+            // pos.line is 0-indexed, matching Position::line
             let suppressed = diagnostic.start.as_ref().is_some_and(|pos| {
-              maybe_source_text
-                .is_some_and(|text| is_import_suppressed(text, pos.line))
+              maybe_parsed_source
+                .as_ref()
+                .is_some_and(|ps| is_resolution_suppressed(ps, pos.line as u32))
             });
             if !suppressed {
               self.missing_diagnostics.push(diagnostic);
@@ -1090,45 +1122,34 @@ fn get_leading_comments(file_text: &str) -> Vec<String> {
   results
 }
 
-/// Returns `true` if a `//`-style line is a TypeScript suppression directive.
+/// Returns `true` if the resolution error at `import_line` (0-indexed,
+/// matches `tsc::Position::line`) is suppressed by a `// @ts-ignore`,
+/// `// @ts-expect-error`, `/* @ts-ignore */`, or `/* @ts-expect-error */`
+/// comment whose last line is immediately above the import.
 ///
-/// Handles optional whitespace between `//` and the directive token, e.g.:
-/// `// @ts-ignore`, `//  @ts-ignore`, `// @ts-expect-error: reason`.
-///
-/// Note: block-comment suppression (`/* @ts-ignore */`) is not handled here.
-/// TODO: Integrate with TypeScript suppressed diagnostics for more accurate handling.
-fn is_ts_suppression_comment(line: &str) -> bool {
-  let rest = match line.strip_prefix("//") {
-    Some(r) => r.trim_start(),
-    None => return false,
-  };
-  rest.starts_with("@ts-ignore") || rest.starts_with("@ts-expect-error")
-}
-
-/// Returns `true` if the import at the given 0-indexed `import_line` is
-/// immediately preceded by a `// @ts-ignore` or `// @ts-expect-error`
-/// suppression directive.
-///
-/// Scans up to 2 source lines above the import, skipping blank lines, and
-/// checks whether the first non-blank line found is a suppression comment.
-fn is_import_suppressed(source_text: &str, import_line: u64) -> bool {
+/// Uses parsed AST comment nodes so multi-line imports, block comments,
+/// and re-exports (`export { x } from '…'`) are all handled correctly.
+fn is_resolution_suppressed(
+  parsed_source: &deno_ast::ParsedSource,
+  import_line: u32, // 0-indexed
+) -> bool {
   if import_line == 0 {
     return false;
   }
-  let start = import_line as usize;
-  let scan_from = start.saturating_sub(2);
-  let mut window = [""; 2];
-  let mut count = 0usize;
-  for line in source_text.lines().skip(scan_from).take(start - scan_from) {
-    window[count] = line;
-    count += 1;
-  }
-  for i in (0..count).rev() {
-    let line = window[i].trim();
-    if line.is_empty() {
-      continue;
+  let preceding_line = import_line - 1;
+  let text_info = parsed_source.text_info_lazy();
+
+  for comment in parsed_source.comments().get_vec() {
+    // Use comment.start() (the `//` or `/*` position) to determine the line.
+    // comment.end() can land on the following line's byte position when span.hi
+    // points at the trailing newline, causing an off-by-one.
+    let comment_line = text_info.line_index(comment.start()) as u32;
+    if comment_line == preceding_line {
+      let text = comment.text.trim();
+      if text.starts_with("@ts-ignore") || text.starts_with("@ts-expect-error") {
+        return true;
+      }
     }
-    return is_ts_suppression_comment(line);
   }
   false
 }
@@ -1140,8 +1161,19 @@ mod test {
   use super::ambient_modules_to_regex_string;
   use super::get_leading_comments;
   use super::has_ts_check;
-  use super::is_import_suppressed;
-  use super::is_ts_suppression_comment;
+  use super::is_resolution_suppressed;
+
+  fn parse_test_source(source: &str) -> deno_ast::ParsedSource {
+    deno_ast::parse_module(deno_ast::ParseParams {
+      specifier: deno_ast::ModuleSpecifier::parse("file:///test.ts").unwrap(),
+      text: source.into(),
+      media_type: deno_ast::MediaType::TypeScript,
+      capture_tokens: false,
+      scope_analysis: false,
+      maybe_syntax: None,
+    })
+    .unwrap()
+  }
 
   #[test]
   fn get_leading_comments_test() {
@@ -1197,82 +1229,71 @@ mod test {
   }
 
   #[test]
-  fn is_ts_suppression_comment_test() {
-    // Standard forms.
-    assert!(is_ts_suppression_comment("// @ts-ignore"));
-    assert!(is_ts_suppression_comment("// @ts-expect-error"));
-
-    // Extra whitespace between `//` and the directive.
-    assert!(is_ts_suppression_comment("//   @ts-ignore"));
-    assert!(is_ts_suppression_comment("//\t@ts-expect-error"));
-
-    // Directive with a trailing reason/annotation.
-    assert!(is_ts_suppression_comment("// @ts-ignore: reason"));
-    assert!(is_ts_suppression_comment("// @ts-expect-error ts(2307)"));
-
-    // Block comments are not handled (out of scope).
-    assert!(!is_ts_suppression_comment("/* @ts-ignore */"));
-
-    // Wrong directive name.
-    assert!(!is_ts_suppression_comment("// @ts-check"));
-    assert!(!is_ts_suppression_comment("// @ts-nocheck"));
-
-    // Not a comment at all.
-    assert!(!is_ts_suppression_comment("const x = 1;"));
-  }
-
-  #[test]
-  fn is_import_suppressed_test() {
-    // Suppressed by @ts-expect-error on the line immediately above.
-    assert!(is_import_suppressed(
-      "// @ts-expect-error\nimport { foo } from 'pkg'",
-      1
+  fn is_resolution_suppressed_test() {
+    // Line comment immediately above.
+    assert!(is_resolution_suppressed(
+      &parse_test_source("// @ts-ignore\nimport { foo } from 'pkg'"),
+      1,
     ));
 
-    // Suppressed by @ts-ignore on the line immediately above.
-    assert!(is_import_suppressed(
-      "// @ts-ignore\nimport { foo } from 'pkg'",
-      1
+    // @ts-expect-error variant.
+    assert!(is_resolution_suppressed(
+      &parse_test_source("// @ts-expect-error\nimport { foo } from 'pkg'"),
+      1,
     ));
 
-    // @ts-expect-error with an annotation message still suppresses.
-    assert!(is_import_suppressed(
-      "// @ts-expect-error intentional\nimport { foo } from 'pkg'",
-      1
+    // Extra whitespace inside line comment.
+    assert!(is_resolution_suppressed(
+      &parse_test_source("//   @ts-ignore\nimport { foo } from 'pkg'"),
+      1,
     ));
 
-    // Extra whitespace between `//` and the directive still suppresses.
-    assert!(is_import_suppressed(
-      "//   @ts-ignore\nimport { foo } from 'pkg'",
-      1
+    // Annotation message after directive still suppresses.
+    assert!(is_resolution_suppressed(
+      &parse_test_source("// @ts-expect-error ts(2307)\nimport { foo } from 'pkg'"),
+      1,
     ));
 
-    // Blank line between the comment and the import — still suppressed
-    // because we scan up to 2 lines and skip blanks.
-    assert!(is_import_suppressed(
-      "// @ts-expect-error\n\nimport { foo } from 'pkg'",
-      2
+    // Block comment suppresses.
+    assert!(is_resolution_suppressed(
+      &parse_test_source("/* @ts-ignore */\nimport { foo } from 'pkg'"),
+      1,
+    ));
+
+    // Block comment with @ts-expect-error.
+    assert!(is_resolution_suppressed(
+      &parse_test_source("/* @ts-expect-error */\nimport { foo } from 'pkg'"),
+      1,
+    ));
+
+    // Re-export also suppressed.
+    assert!(is_resolution_suppressed(
+      &parse_test_source("// @ts-ignore\nexport { foo } from 'pkg'"),
+      1,
     ));
 
     // No suppression comment above — not suppressed.
-    assert!(!is_import_suppressed(
-      "const x = 1;\nimport { foo } from 'pkg'",
-      1
+    assert!(!is_resolution_suppressed(
+      &parse_test_source("const x = 1;\nimport { foo } from 'pkg'"),
+      1,
     ));
 
-    // Suppression comment exists but is 3 raw lines above (beyond scan limit).
-    assert!(!is_import_suppressed(
-      "// @ts-expect-error\nline_a\nline_b\nimport { foo } from 'pkg'",
-      3
+    // Import on line 0 — nothing above.
+    assert!(!is_resolution_suppressed(
+      &parse_test_source("import { foo } from 'pkg'"),
+      0,
     ));
 
-    // Import on line 0 — no lines above to check.
-    assert!(!is_import_suppressed("import { foo } from 'pkg'", 0));
+    // Comment exists but is 2 lines above (not immediately preceding).
+    assert!(!is_resolution_suppressed(
+      &parse_test_source("// @ts-ignore\n\nimport { foo } from 'pkg'"),
+      2,
+    ));
 
-    // Similar-looking but incorrect directive is not treated as suppression.
-    assert!(!is_import_suppressed(
-      "// @ts-check\nimport { foo } from 'pkg'",
-      1
+    // Wrong directive — not suppressed.
+    assert!(!is_resolution_suppressed(
+      &parse_test_source("// @ts-check\nimport { foo } from 'pkg'"),
+      1,
     ));
   }
 }
