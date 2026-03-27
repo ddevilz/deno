@@ -786,16 +786,16 @@ impl<'a> GraphWalker<'a> {
               }
             });
             if !suppressed {
-              self
-                .missing_diagnostics
-                .push(tsc::Diagnostic::from_missing_error(
+              self.missing_diagnostics.push(
+                tsc::Diagnostic::from_missing_error(
                   err.specifier.as_str(),
                   err.maybe_range,
                   maybe_additional_sloppy_imports_message(
                     self.sys,
                     err.specifier,
                   ),
-                ));
+                ),
+              );
             }
           }
           continue;
@@ -1125,7 +1125,7 @@ fn get_leading_comments(file_text: &str) -> Vec<String> {
 /// Returns `true` if the resolution error at `import_line` (0-indexed,
 /// matches `tsc::Position::line`) is suppressed by a `// @ts-ignore`,
 /// `// @ts-expect-error`, `/* @ts-ignore */`, or `/* @ts-expect-error */`
-/// comment whose last line is immediately above the import.
+/// comment on the line immediately above the import.
 ///
 /// Uses parsed AST comment nodes so multi-line imports, block comments,
 /// and re-exports (`export { x } from '…'`) are all handled correctly.
@@ -1146,7 +1146,8 @@ fn is_resolution_suppressed(
     let comment_line = text_info.line_index(comment.start()) as u32;
     if comment_line == preceding_line {
       let text = comment.text.trim();
-      if text.starts_with("@ts-ignore") || text.starts_with("@ts-expect-error") {
+      if text.starts_with("@ts-ignore") || text.starts_with("@ts-expect-error")
+      {
         return true;
       }
     }
@@ -1250,7 +1251,9 @@ mod test {
 
     // Annotation message after directive still suppresses.
     assert!(is_resolution_suppressed(
-      &parse_test_source("// @ts-expect-error ts(2307)\nimport { foo } from 'pkg'"),
+      &parse_test_source(
+        "// @ts-expect-error ts(2307)\nimport { foo } from 'pkg'"
+      ),
       1,
     ));
 
