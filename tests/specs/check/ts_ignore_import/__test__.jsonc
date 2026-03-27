@@ -20,6 +20,21 @@
       "output": "suppressed.out",
       "exitCode": 0
     },
+    "multi_line_suppressed": {
+      "args": "check multi_line.ts",
+      "output": "suppressed.out",
+      "exitCode": 0
+    },
+    "multi_line_block_comment_suppressed": {
+      "args": "check multi_line_block_comment.ts",
+      "output": "suppressed.out",
+      "exitCode": 0
+    },
+    "inline_comment_unsuppressed": {
+      "args": "check inline_comment.ts",
+      "output": "inline_comment_unsuppressed.out",
+      "exitCode": 1
+    },
     "unsuppressed_errors": {
       "args": "check unsuppressed.ts",
       "output": "unsuppressed.out",
