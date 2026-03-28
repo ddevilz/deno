@@ -1140,34 +1140,41 @@ fn get_leading_comments(file_text: &str) -> Vec<String> {
   results
 }
 
-/// Returns `true` if the resolution error at `import_line` (0-indexed,
-/// matches `tsc::Position::line`) is suppressed by a `// @ts-ignore`,
-/// `// @ts-expect-error`, `/* @ts-ignore */`, or `/* @ts-expect-error */`
-/// comment on the line immediately above the import.
+/// Returns `true` if `import_line` (0-indexed) has a `@ts-ignore` or
+/// `@ts-expect-error` comment on the line immediately above its statement.
 ///
-/// Uses parsed AST comment nodes so multi-line imports, block comments,
-/// and re-exports (`export { x } from '…'`) are all handled correctly.
+/// Checks for a `@ts-ignore` or `@ts-expect-error` comment immediately above.
 fn is_resolution_suppressed(
   parsed_source: &deno_ast::ParsedSource,
   import_line: u32, // 0-indexed
 ) -> bool {
-  if import_line == 0 {
-    return false;
-  }
-  let preceding_line = import_line - 1;
   let text_info = parsed_source.text_info_lazy();
+  let comments = parsed_source.comments();
 
-  for comment in parsed_source.comments().get_vec() {
-    // Use comment.start() (the `//` or `/*` position) to determine the line.
-    // comment.end() can land on the following line's byte position when span.hi
-    // points at the trailing newline, causing an off-by-one.
-    let comment_line = text_info.line_index(comment.start()) as u32;
-    if comment_line == preceding_line {
-      let text = comment.text.trim();
-      if text.starts_with("@ts-ignore") || text.starts_with("@ts-expect-error")
-      {
-        return true;
+  for item in parsed_source.program_ref().body() {
+    let item_start_line = text_info.line_index(item.start()) as u32;
+    let item_end_line = text_info.line_index(item.end()) as u32;
+
+    if item_start_line <= import_line && import_line <= item_end_line {
+      if item_start_line == 0 {
+        return false;
       }
+      let preceding_line = item_start_line - 1;
+      if let Some(leading) = comments.get_leading(item.start()) {
+        for comment in leading {
+          let comment_line =
+            text_info.line_index(comment.start()) as u32;
+          if comment_line == preceding_line {
+            let text = comment.text.trim();
+            if text.starts_with("@ts-ignore")
+              || text.starts_with("@ts-expect-error")
+            {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
     }
   }
   false
@@ -1323,6 +1330,39 @@ mod test {
         "const x = 1; // @ts-ignore\nimport { foo } from 'pkg'"
       ),
       1,
+    ));
+
+    // Multi-line import — error position is on the `from` clause (line 3),
+    // but @ts-ignore is on the line above the `import` keyword (line 0).
+    assert!(is_resolution_suppressed(
+      &parse_test_source(
+        "// @ts-ignore\nimport {\n  foo,\n} from 'pkg'"
+      ),
+      3, // 0-indexed line of `} from 'pkg'`
+    ));
+
+    // Multi-line import with block comment.
+    assert!(is_resolution_suppressed(
+      &parse_test_source(
+        "/* @ts-ignore */\nimport {\n  foo,\n} from 'pkg'"
+      ),
+      3,
+    ));
+
+    // Multi-line import — @ts-expect-error above import keyword.
+    assert!(is_resolution_suppressed(
+      &parse_test_source(
+        "// @ts-expect-error\nimport {\n  foo,\n} from 'pkg'"
+      ),
+      3,
+    ));
+
+    // Multi-line import — comment is 2 lines above import keyword, not immediately preceding.
+    assert!(!is_resolution_suppressed(
+      &parse_test_source(
+        "// @ts-ignore\n\nimport {\n  foo,\n} from 'pkg'"
+      ),
+      4, // 0-indexed line of `} from 'pkg'` (blank line shifts everything by 1)
     ));
   }
 }
