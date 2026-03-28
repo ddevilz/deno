@@ -772,28 +772,12 @@ impl<'a> GraphWalker<'a> {
             && let Some(err) = module_error_for_tsc_diagnostic(self.sys, err)
           {
             let suppressed = err.maybe_range.is_some_and(|range| {
-              let import_line = range.range.start.line as u32;
-              if let Some(ps) = self.parsed_source_cache.get(&range.specifier) {
-                return is_resolution_suppressed(ps, import_line);
-              }
-              let Ok(Some(Module::Js(referrer_module))) =
-                self.graph.try_get(&range.specifier)
-              else {
-                return false;
-              };
-              let Ok(ps) = deno_ast::parse_module(deno_ast::ParseParams {
-                specifier: referrer_module.specifier.clone(),
-                text: referrer_module.source.text.clone(),
-                media_type: referrer_module.media_type,
-                capture_tokens: false,
-                scope_analysis: false,
-                maybe_syntax: None,
-              }) else {
-                return false;
-              };
-              let result = is_resolution_suppressed(&ps, import_line);
-              self.parsed_source_cache.insert(range.specifier.clone(), ps);
-              result
+              check_suppressed_at(
+                self.graph,
+                &mut self.parsed_source_cache,
+                &range.specifier,
+                range.range.start.line as u32,
+              )
             });
             if !suppressed {
               self.missing_diagnostics.push(
@@ -884,27 +868,12 @@ impl<'a> GraphWalker<'a> {
           {
             // pos.line is 0-indexed, matching Position::line
             let suppressed = diagnostic.start.as_ref().is_some_and(|pos| {
-              let import_line = pos.line as u32;
-              let specifier = module.specifier();
-              if let Some(ps) = self.parsed_source_cache.get(specifier) {
-                return is_resolution_suppressed(ps, import_line);
-              }
-              let Module::Js(js_module) = module else {
-                return false;
-              };
-              let Ok(ps) = deno_ast::parse_module(deno_ast::ParseParams {
-                specifier: js_module.specifier.clone(),
-                text: js_module.source.text.clone(),
-                media_type: js_module.media_type,
-                capture_tokens: false,
-                scope_analysis: false,
-                maybe_syntax: None,
-              }) else {
-                return false;
-              };
-              let result = is_resolution_suppressed(&ps, import_line);
-              self.parsed_source_cache.insert(specifier.clone(), ps);
-              result
+              check_suppressed_at(
+                self.graph,
+                &mut self.parsed_source_cache,
+                module.specifier(),
+                pos.line as u32,
+              )
             });
             if !suppressed {
               self.missing_diagnostics.push(diagnostic);
@@ -1138,6 +1107,36 @@ fn get_leading_comments(file_text: &str) -> Vec<String> {
     }
   }
   results
+}
+
+/// Checks whether the import at `import_line` inside `specifier` is suppressed
+/// by a `@ts-ignore` / `@ts-expect-error` directive. Consults and populates
+/// `cache` so each source file is only parsed once per type-check run.
+fn check_suppressed_at(
+  graph: &ModuleGraph,
+  cache: &mut HashMap<ModuleSpecifier, deno_ast::ParsedSource>,
+  specifier: &ModuleSpecifier,
+  import_line: u32,
+) -> bool {
+  if let Some(ps) = cache.get(specifier) {
+    return is_resolution_suppressed(ps, import_line);
+  }
+  let Ok(Some(Module::Js(js_module))) = graph.try_get(specifier) else {
+    return false;
+  };
+  let Ok(ps) = deno_ast::parse_module(deno_ast::ParseParams {
+    specifier: js_module.specifier.clone(),
+    text: js_module.source.text.clone(),
+    media_type: js_module.media_type,
+    capture_tokens: false,
+    scope_analysis: false,
+    maybe_syntax: None,
+  }) else {
+    return false;
+  };
+  let result = is_resolution_suppressed(&ps, import_line);
+  cache.insert(specifier.clone(), ps);
+  result
 }
 
 /// Uses the AST declaration that spans `import_line` so multi-line imports
