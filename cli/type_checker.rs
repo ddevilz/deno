@@ -21,6 +21,7 @@ use deno_resolver::deno_json::CompilerOptionsParseError;
 use deno_resolver::deno_json::CompilerOptionsResolver;
 use deno_resolver::deno_json::JsxImportSourceConfigResolver;
 use deno_resolver::deno_json::ToMaybeJsxImportSourceConfigError;
+use deno_resolver::cache::ParsedSourceCache;
 use deno_resolver::graph::maybe_additional_sloppy_imports_message;
 use deno_semver::npm::NpmPackageReqReference;
 use deno_terminal::colors;
@@ -110,6 +111,7 @@ pub struct TypeChecker {
   node_resolver: Arc<CliNodeResolver>,
   npm_resolver: CliNpmResolver,
   package_json_resolver: Arc<CliPackageJsonResolver>,
+  parsed_source_cache: Arc<ParsedSourceCache>,
   sys: CliSys,
   compiler_options_resolver: Arc<CompilerOptionsResolver>,
   code_cache: Option<Arc<crate::cache::CodeCache>>,
@@ -126,6 +128,7 @@ impl TypeChecker {
     node_resolver: Arc<CliNodeResolver>,
     npm_resolver: CliNpmResolver,
     package_json_resolver: Arc<CliPackageJsonResolver>,
+    parsed_source_cache: Arc<ParsedSourceCache>,
     sys: CliSys,
     compiler_options_resolver: Arc<CompilerOptionsResolver>,
     code_cache: Option<Arc<crate::cache::CodeCache>>,
@@ -139,6 +142,7 @@ impl TypeChecker {
       node_resolver,
       npm_resolver,
       package_json_resolver,
+      parsed_source_cache,
       sys,
       compiler_options_resolver,
       code_cache,
@@ -249,6 +253,7 @@ impl TypeChecker {
         node_resolver: &self.node_resolver,
         npm_resolver: &self.npm_resolver,
         package_json_resolver: &self.package_json_resolver,
+        parsed_source_cache: &self.parsed_source_cache,
         compiler_options_resolver: &self.compiler_options_resolver,
         log_level: self.cli_options.log_level(),
         npm_check_state_hash: check_state_hash(&self.npm_resolver),
@@ -385,6 +390,7 @@ struct DiagnosticsByFolderRealIterator<'a> {
   node_resolver: &'a Arc<CliNodeResolver>,
   npm_resolver: &'a CliNpmResolver,
   package_json_resolver: &'a Arc<CliPackageJsonResolver>,
+  parsed_source_cache: &'a Arc<ParsedSourceCache>,
   compiler_options_resolver: &'a CompilerOptionsResolver,
   type_check_cache: TypeCheckCache,
   groups: Vec<CheckGroup<'a>>,
@@ -471,6 +477,7 @@ impl DiagnosticsByFolderRealIterator<'_> {
       self.node_resolver,
       self.npm_resolver,
       self.compiler_options_resolver,
+      self.parsed_source_cache,
       self.npm_check_state_hash,
       check_group.compiler_options,
       self.options.type_check_mode,
@@ -651,16 +658,13 @@ struct GraphWalker<'a> {
   node_resolver: &'a CliNodeResolver,
   npm_resolver: &'a CliNpmResolver,
   compiler_options_resolver: &'a CompilerOptionsResolver,
+  parsed_source_cache: &'a ParsedSourceCache,
   maybe_hasher: Option<FastInsecureHasher>,
   seen: HashSet<&'a Url>,
   pending: VecDeque<(&'a Url, bool)>,
   has_seen_node_builtin: bool,
   roots: Vec<(ModuleSpecifier, MediaType)>,
   missing_diagnostics: tsc::Diagnostics,
-  /// Cache of parsed sources keyed by specifier, used to check whether a
-  /// resolution error is suppressed by a `@ts-ignore` / `@ts-expect-error`
-  /// comment without re-parsing the same source file more than once.
-  parsed_source_cache: HashMap<ModuleSpecifier, deno_ast::ParsedSource>,
 }
 
 impl<'a> GraphWalker<'a> {
@@ -671,6 +675,7 @@ impl<'a> GraphWalker<'a> {
     node_resolver: &'a CliNodeResolver,
     npm_resolver: &'a CliNpmResolver,
     compiler_options_resolver: &'a CompilerOptionsResolver,
+    parsed_source_cache: &'a ParsedSourceCache,
     npm_cache_state_hash: Option<u64>,
     compiler_options: &CompilerOptions,
     type_check_mode: TypeCheckMode,
@@ -693,6 +698,7 @@ impl<'a> GraphWalker<'a> {
       node_resolver,
       npm_resolver,
       compiler_options_resolver,
+      parsed_source_cache,
       maybe_hasher,
       seen: HashSet::with_capacity(
         graph.imports.len() + graph.specifiers_count(),
@@ -701,7 +707,6 @@ impl<'a> GraphWalker<'a> {
       has_seen_node_builtin: false,
       roots: Vec::with_capacity(graph.imports.len() + graph.specifiers_count()),
       missing_diagnostics: Default::default(),
-      parsed_source_cache: HashMap::new(),
     }
   }
 
@@ -774,7 +779,7 @@ impl<'a> GraphWalker<'a> {
             let suppressed = err.maybe_range.is_some_and(|range| {
               check_suppressed_at(
                 self.graph,
-                &mut self.parsed_source_cache,
+                self.parsed_source_cache,
                 &range.specifier,
                 range.range.start.line as u32,
               )
@@ -870,7 +875,7 @@ impl<'a> GraphWalker<'a> {
             let suppressed = diagnostic.start.as_ref().is_some_and(|pos| {
               check_suppressed_at(
                 self.graph,
-                &mut self.parsed_source_cache,
+                self.parsed_source_cache,
                 module.specifier(),
                 pos.line as u32,
               )
@@ -1110,33 +1115,22 @@ fn get_leading_comments(file_text: &str) -> Vec<String> {
 }
 
 /// Checks whether the import at `import_line` inside `specifier` is suppressed
-/// by a `@ts-ignore` / `@ts-expect-error` directive. Consults and populates
-/// `cache` so each source file is only parsed once per type-check run.
+/// by a `@ts-ignore` / `@ts-expect-error` directive. Delegates parsing and
+/// caching to the shared `ParsedSourceCache` so no source is parsed twice
+/// across the whole type-check run.
 fn check_suppressed_at(
   graph: &ModuleGraph,
-  cache: &mut HashMap<ModuleSpecifier, deno_ast::ParsedSource>,
+  cache: &ParsedSourceCache,
   specifier: &ModuleSpecifier,
   import_line: u32,
 ) -> bool {
-  if let Some(ps) = cache.get(specifier) {
-    return is_resolution_suppressed(ps, import_line);
-  }
   let Ok(Some(Module::Js(js_module))) = graph.try_get(specifier) else {
     return false;
   };
-  let Ok(ps) = deno_ast::parse_module(deno_ast::ParseParams {
-    specifier: js_module.specifier.clone(),
-    text: js_module.source.text.clone(),
-    media_type: js_module.media_type,
-    capture_tokens: false,
-    scope_analysis: false,
-    maybe_syntax: None,
-  }) else {
+  let Ok(ps) = cache.get_parsed_source_from_js_module(js_module) else {
     return false;
   };
-  let result = is_resolution_suppressed(&ps, import_line);
-  cache.insert(specifier.clone(), ps);
-  result
+  is_resolution_suppressed(&ps, import_line)
 }
 
 /// Uses the AST declaration that spans `import_line` so multi-line imports
@@ -1156,6 +1150,7 @@ fn is_resolution_suppressed(
 
     if item_start_line <= import_line && import_line <= item_end_line {
       if item_start_line == 0 {
+        // Nothing can precede line 0; also guards against u32 underflow below.
         return false;
       }
       let preceding_line = item_start_line - 1;
@@ -1164,6 +1159,12 @@ fn is_resolution_suppressed(
           let comment_line = text_info.line_index(comment.start()) as u32;
           if comment_line == preceding_line {
             let text = comment.text.trim();
+            // NOTE: @ts-expect-error is treated the same as @ts-ignore here.
+            // Ideally, unconsumed @ts-expect-error directives would emit
+            // TS2578 ("Unused '@ts-expect-error' directive"), but these
+            // missing-module diagnostics bypass tsc, so that tracking is not
+            // implemented. Anyone who removes the broken import will simply
+            // have a stale directive that is silently ignored.
             if text.starts_with("@ts-ignore")
               || text.starts_with("@ts-expect-error")
             {
