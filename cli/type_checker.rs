@@ -115,7 +115,6 @@ pub struct TypeChecker {
   sys: CliSys,
   compiler_options_resolver: Arc<CompilerOptionsResolver>,
   code_cache: Option<Arc<crate::cache::CodeCache>>,
-  tsgo_path: Option<PathBuf>,
 }
 
 impl TypeChecker {
@@ -132,7 +131,6 @@ impl TypeChecker {
     sys: CliSys,
     compiler_options_resolver: Arc<CompilerOptionsResolver>,
     code_cache: Option<Arc<crate::cache::CodeCache>>,
-    tsgo_path: Option<PathBuf>,
   ) -> Self {
     Self {
       caches,
@@ -146,7 +144,6 @@ impl TypeChecker {
       sys,
       compiler_options_resolver,
       code_cache,
-      tsgo_path,
     }
   }
 
@@ -252,7 +249,7 @@ impl TypeChecker {
         ),
         node_resolver: &self.node_resolver,
         npm_resolver: &self.npm_resolver,
-        package_json_resolver: &self.package_json_resolver,
+        _package_json_resolver: &self.package_json_resolver,
         parsed_source_cache: &self.parsed_source_cache,
         compiler_options_resolver: &self.compiler_options_resolver,
         log_level: self.cli_options.log_level(),
@@ -265,7 +262,6 @@ impl TypeChecker {
         options,
         seen_diagnotics: Default::default(),
         code_cache: self.code_cache.clone(),
-        tsgo_path: self.tsgo_path.clone(),
         initial_cwd: self.cli_options.initial_cwd().to_path_buf(),
         current_dir: deno_path_util::url_from_directory_path(
           self.cli_options.initial_cwd(),
@@ -389,7 +385,7 @@ struct DiagnosticsByFolderRealIterator<'a> {
   jsx_import_source_config_resolver: Arc<JsxImportSourceConfigResolver>,
   node_resolver: &'a Arc<CliNodeResolver>,
   npm_resolver: &'a CliNpmResolver,
-  package_json_resolver: &'a Arc<CliPackageJsonResolver>,
+  _package_json_resolver: &'a Arc<CliPackageJsonResolver>,
   parsed_source_cache: &'a Arc<ParsedSourceCache>,
   compiler_options_resolver: &'a CompilerOptionsResolver,
   type_check_cache: TypeCheckCache,
@@ -400,7 +396,6 @@ struct DiagnosticsByFolderRealIterator<'a> {
   seen_diagnotics: HashSet<String>,
   options: CheckOptions,
   code_cache: Option<Arc<crate::cache::CodeCache>>,
-  tsgo_path: Option<PathBuf>,
   initial_cwd: PathBuf,
   current_dir: Url,
 }
@@ -561,7 +556,6 @@ impl DiagnosticsByFolderRealIterator<'_> {
           cjs_tracker: self.cjs_tracker.clone(),
           node_resolver: self.node_resolver.clone(),
           npm_resolver: self.npm_resolver.clone(),
-          package_json_resolver: self.package_json_resolver.clone(),
         }),
         maybe_tsbuildinfo,
         root_names,
@@ -569,7 +563,6 @@ impl DiagnosticsByFolderRealIterator<'_> {
         initial_cwd: self.initial_cwd.clone(),
       },
       code_cache,
-      self.tsgo_path.as_deref(),
     )?;
 
     let ambient_modules = response.ambient_modules;
