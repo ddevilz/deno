@@ -1,0 +1,7 @@
+{
+  "name": "@denotest/cjs-wrapper-for-missing-named-export",
+  "version": "1.0.0",
+  "dependencies": {
+    "@denotest/cjs-missing-named-export": "1"
+  }
+}

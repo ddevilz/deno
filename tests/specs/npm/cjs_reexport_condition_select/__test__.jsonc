@@ -1,0 +1,35 @@
+{
+  // Regression test for: CJS reexport analyzer hardcodes "require" condition
+  // when resolving through CJS re-exports, causing the "import" export condition
+  // (and its associated ESM build) to be ignored even when the direct importer
+  // is an ESM module.
+  //
+  // The dual-build package exposes:
+  //   "import" -> dist/index.module.js  (has Fragment)
+  //   "require" -> dist/index.js        (missing Fragment)
+  //
+  // When imported directly from ESM, Deno should pick the "import" condition.
+  // When the package is reached through CJS analyze_reexports(), it currently
+  // hardcodes ResolutionMode::Require, picking the wrong build.
+  "tests": {
+    "esm_direct_import_gets_fragment": {
+      // Direct import from ESM — should always get the "import" condition build
+      "args": "run esm_direct.ts",
+      "output": "esm_direct.out"
+    },
+    "cjs_reexport_import_loses_fragment": {
+      // BUG: Import through CJS wrapper loses ALL named exports.
+      // The CJS reexport analyzer in analyze_reexports() (node_resolver/analyze.rs)
+      // hardcodes ResolutionMode::Require + ["deno","node","require","default"]
+      // conditions (see FIXME comment at line ~236). This resolves the inner
+      // package via the "require" export condition to dist/index.js (CJS build),
+      // which only defines exports via Object.defineProperty and __esModule —
+      // the static CJS analysis finds zero named exports. The generated ESM
+      // wrapper is therefore empty, causing the SyntaxError below.
+      // Expected (after fix): all three exports resolve from dist/index.module.js
+      // via the "import" condition.
+      "args": "run cjs_via_reexport.ts",
+      "output": "cjs_via_reexport.out"
+    }
+  }
+}
