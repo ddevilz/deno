@@ -271,7 +271,7 @@ impl LibUvStreamWrap {
     self.handle_data.active_read.set(Some(key));
   }
 
-  fn stable_handle_data(
+  pub(crate) fn stable_handle_data(
     stream: *mut uv_stream_t,
   ) -> Option<NonNull<StreamHandleData>> {
     if stream.is_null() {
@@ -293,11 +293,10 @@ impl LibUvStreamWrap {
     // `StreamHandleData` allocation while the native stream is alive.
     let handle_data = unsafe { handle_data_ptr.as_ref() };
     handle_data.desired_read_interceptor.set(interceptor);
-    if let Some(key) = handle_data.active_read.get() {
-      let _ = handle_data
-        .read_callbacks
-        .borrow_mut()
-        .update_interceptor(key, interceptor);
+    if let Some(key) = handle_data.active_read.get()
+      && let Ok(mut callbacks) = handle_data.read_callbacks.try_borrow_mut()
+    {
+      let _ = callbacks.update_interceptor(key, interceptor);
     }
   }
 
@@ -315,18 +314,22 @@ impl LibUvStreamWrap {
       return 0;
     }
 
-    let key =
-      handle_data
-        .read_callbacks
-        .borrow_mut()
-        .insert(ReadCallbackState {
-          isolate: v8::UnsafeRawIsolatePtr::null(),
-          onread: None,
-          stream_base_state: None,
-          handle: None,
-          bytes_read: handle_data.bytes_read.clone(),
-          read_interceptor: handle_data.desired_read_interceptor.get(),
-        });
+    // Use try_borrow_mut to handle re-entrant calls gracefully.
+    // This can happen when uv_read_start fires on_uv_read synchronously
+    // (data already buffered), whose interceptor calls cycle() which
+    // may call back into read_start.
+    let Ok(mut callbacks) = handle_data.read_callbacks.try_borrow_mut() else {
+      return 0;
+    };
+    let key = callbacks.insert(ReadCallbackState {
+      isolate: v8::UnsafeRawIsolatePtr::null(),
+      onread: None,
+      stream_base_state: None,
+      handle: None,
+      bytes_read: handle_data.bytes_read.clone(),
+      read_interceptor: handle_data.desired_read_interceptor.get(),
+    });
+    drop(callbacks);
     handle_data.active_read.set(Some(key));
 
     // SAFETY: `stream` is a valid libuv stream owned by this wrapper.
@@ -343,7 +346,11 @@ impl LibUvStreamWrap {
     // `StreamHandleData` allocation while the native stream is alive.
     let handle_data = unsafe { handle_data_ptr.as_ref() };
     if let Some(key) = handle_data.active_read.take() {
-      let _ = handle_data.read_callbacks.borrow_mut().remove(key);
+      // Use try_borrow_mut to handle re-entrant calls from interceptor
+      // callbacks that may fire during on_uv_read processing.
+      if let Ok(mut callbacks) = handle_data.read_callbacks.try_borrow_mut() {
+        let _ = callbacks.remove(key);
+      }
     }
     // SAFETY: `stream` is a valid libuv stream owned by this wrapper.
     unsafe { uv_compat::uv_read_stop(stream) }
@@ -571,6 +578,9 @@ unsafe extern "C" fn on_uv_read(
       let onread = v8::Local::new(scope, &onread_global);
       let recv = v8::Local::new(scope, &handle_global);
       let undef = v8::undefined(scope);
+      // EOF/error path: don't report exceptions as fatal.
+      // Socket errors (hang up, reset, etc.) are expected lifecycle
+      // events that should be handled by the socket's error handler.
       onread.call(scope, recv.into(), &[undef.into()]);
     }
     return;
@@ -617,7 +627,38 @@ unsafe extern "C" fn on_uv_read(
   // Matches Node's convention: nread is in streamBaseState[kReadBytesOrError].
   let onread = v8::Local::new(scope, &onread_global);
   let recv = v8::Local::new(scope, &handle_global);
-  onread.call(scope, recv.into(), &[ab.into()]);
+  let caught_exception = {
+    v8::tc_scope!(tc, scope);
+    let result = onread.call(tc, recv.into(), &[ab.into()]);
+    if result.is_none() && tc.has_caught() {
+      let exc = tc.exception();
+      tc.reset();
+      exc
+    } else {
+      None
+    }
+  };
+  if let Some(exception) = caught_exception {
+    call_fatal_exception(scope, exception);
+  }
+}
+
+/// Handle uncaught exceptions from stream onread callbacks.
+/// Uses globalThis.reportError() to report the exception as uncaught,
+/// matching Node's MakeCallback behavior where unhandled exceptions
+/// from native callbacks terminate the process.
+fn call_fatal_exception(
+  scope: &mut v8::ContextScope<v8::HandleScope>,
+  exception: v8::Local<v8::Value>,
+) {
+  let global = scope.get_current_context().global(scope);
+  let key = v8::String::new(scope, "reportError").unwrap();
+  if let Some(report_fn_val) = global.get(scope, key.into())
+    && let Ok(report_fn) = v8::Local::<v8::Function>::try_from(report_fn_val)
+  {
+    let undef = v8::undefined(scope);
+    report_fn.call(scope, undef.into(), &[exception]);
+  }
 }
 
 /// Free a buffer allocated by on_uv_alloc.
@@ -637,7 +678,7 @@ fn free_uv_buf(buf: *const uv_buf_t) {
 /// # Safety
 /// `loop_ptr` must be a valid, initialized `uv_loop_t` whose `data` field
 /// contains the raw `Global<Context>` installed by `register_uv_loop`.
-unsafe fn clone_context_from_uv_loop(
+pub(crate) unsafe fn clone_context_from_uv_loop(
   isolate: &mut v8::Isolate,
   loop_ptr: *mut uv_compat::uv_loop_t,
 ) -> v8::Global<v8::Context> {
@@ -1115,13 +1156,16 @@ impl LibUvStreamWrap {
         };
         if let Ok(buf) = TryInto::<v8::Local<v8::Uint8Array>>::try_into(chunk) {
           let byte_len = buf.byte_length();
-          let byte_off = buf.byte_offset();
-          let ab = buf.buffer(scope).unwrap();
-          let ptr = ab.data().unwrap().as_ptr() as *const u8;
-          // SAFETY: ptr points to the backing store of the ArrayBuffer; byte_off + byte_len is within bounds as guaranteed by the Uint8Array view.
-          let slice =
-            unsafe { std::slice::from_raw_parts(ptr.add(byte_off), byte_len) };
-          data.extend_from_slice(slice);
+          if byte_len > 0 {
+            let byte_off = buf.byte_offset();
+            let ab = buf.buffer(scope).unwrap();
+            let ptr = ab.data().unwrap().as_ptr() as *const u8;
+            // SAFETY: ptr points to the backing store of the ArrayBuffer; byte_off + byte_len is within bounds as guaranteed by the Uint8Array view.
+            let slice = unsafe {
+              std::slice::from_raw_parts(ptr.add(byte_off), byte_len)
+            };
+            data.extend_from_slice(slice);
+          }
         }
       }
     } else {
@@ -1133,13 +1177,16 @@ impl LibUvStreamWrap {
         };
         if let Ok(buf) = TryInto::<v8::Local<v8::Uint8Array>>::try_into(chunk) {
           let byte_len = buf.byte_length();
-          let byte_off = buf.byte_offset();
-          let ab = buf.buffer(scope).unwrap();
-          let ptr = ab.data().unwrap().as_ptr() as *const u8;
-          // SAFETY: ptr points to the backing store of the ArrayBuffer; byte_off + byte_len is within bounds as guaranteed by the Uint8Array view.
-          let slice =
-            unsafe { std::slice::from_raw_parts(ptr.add(byte_off), byte_len) };
-          data.extend_from_slice(slice);
+          if byte_len > 0 {
+            let byte_off = buf.byte_offset();
+            let ab = buf.buffer(scope).unwrap();
+            let ptr = ab.data().unwrap().as_ptr() as *const u8;
+            // SAFETY: ptr points to the backing store of the ArrayBuffer; byte_off + byte_len is within bounds as guaranteed by the Uint8Array view.
+            let slice = unsafe {
+              std::slice::from_raw_parts(ptr.add(byte_off), byte_len)
+            };
+            data.extend_from_slice(slice);
+          }
         } else if let Ok(s) = TryInto::<v8::Local<v8::String>>::try_into(chunk)
         {
           let encoding = chunks
